@@ -55,7 +55,6 @@ def generate_radar_chart_impl(data: Dict[str, Any], chart_type: str = "gardner")
             "status": "success",
             "message": "图表生成成功",
             "image_url": img_url,
-            "file_path": filepath,
             "chart_type": chart_type,
         }, ensure_ascii=False)
 
@@ -105,9 +104,11 @@ def _draw_gardner_radar(data: Dict[str, Any], font_path: str) -> bytes:
     plt.tight_layout()
 
     buf = BytesIO()
-    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
-    plt.close()
-    return buf.getvalue()
+    try:
+        plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        return buf.getvalue()
+    finally:
+        plt.close()
 
 
 def _draw_mbti_bar(data: Dict[str, Any], font_path: str) -> bytes:
@@ -139,6 +140,8 @@ def _draw_mbti_bar(data: Dict[str, Any], font_path: str) -> bytes:
     plt.tight_layout()
 
     buf = BytesIO()
-    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
-    plt.close()
-    return buf.getvalue()
+    try:
+        plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        return buf.getvalue()
+    finally:
+        plt.close()

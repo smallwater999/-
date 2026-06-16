@@ -1,9 +1,14 @@
-"""高考志愿智能规划师 - FastAPI HTTP 服务（简化版）
+"""高考志愿智能规划师 - FastAPI HTTP 服务 v2.1
 
-核心改动：
-- 去掉 LangGraph + create_agent，直接调 DeepSeek 原生联网搜索
-- 会话历史简单列表管理，不再依赖 checkpoint 持久化
-- 流式输出直接用 OpenAI SDK 的 stream
+v2.1 安全加固:
+- Admin 端点 Token 认证
+- Per-IP 速率限制
+- IP 防伪造（仅信任 X-Real-IP 白名单来源）
+- 健康检查不再调用真实 LLM
+- Session 绑定 IP 防枚举
+- SSE 心跳按时间间隔发送
+- 请求日志中间件
+- /download 端点
 """
 
 import argparse
@@ -32,12 +37,16 @@ from payment import (
     has_paid, mark_as_paid, check_payment_header, reload_merchant_config,
     get_paid_expiry,
 )
+from tools.report import _get_report_filepath
 from dotenv import load_dotenv
 
 _project_root = os.path.dirname(_src_dir)
 load_dotenv(os.path.join(_project_root, ".env"))
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "admin-secret-change-me")
+TRUSTED_PROXY = os.getenv("TRUSTED_PROXY", "").strip()  # comma-separated trusted proxy IPs
+
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -54,61 +63,80 @@ class ChatRequest(BaseModel):
 
 
 # ============================================================
-# 会话管理（内存，简单列表）
+# 简单速率限制（Per-IP）
 # ============================================================
 
-# {session_id: [{"role": "user"|"assistant", "content": "..."}, ...]}
-_sessions: Dict[str, List[dict]] = {}
-_MAX_SESSION_HISTORY = 50  # 保留最近 50 条消息
+_RATE_LIMITS: Dict[str, list] = {}  # {ip: [timestamps]}
+_RATE_CHAT_LIMIT = 10      # /chat 每分钟 10 次
+_RATE_STREAM_LIMIT = 20    # /stream 每分钟 20 次
+_RATE_WINDOW = 60          # 窗口 60 秒
+
+
+def _check_rate_limit(ip: str, limit: int) -> bool:
+    """简单滑动窗口速率限制。返回 True=放行, False=超限。"""
+    now = time.time()
+    window_start = now - _RATE_WINDOW
+    timestamps = _RATE_LIMITS.get(ip, [])
+    # 清理过期记录
+    timestamps = [t for t in timestamps if t > window_start]
+    _RATE_LIMITS[ip] = timestamps
+    if len(timestamps) >= limit:
+        return False
+    timestamps.append(now)
+    return True
+
+
+# ============================================================
+# 会话管理（内存，绑定 IP）
+# ============================================================
+
+# {session_id: {"history": [...], "ip": "..."}}
+_sessions: Dict[str, dict] = {}
+_MAX_SESSION_HISTORY = 50
 
 
 def _get_history(session_id: str) -> List[dict]:
     if session_id not in _sessions:
-        _sessions[session_id] = []
-    return _sessions[session_id]
+        _sessions[session_id] = {"history": [], "ip": ""}
+    return _sessions[session_id]["history"]
+
+
+def _get_session_ip(session_id: str) -> str:
+    return _sessions.get(session_id, {}).get("ip", "")
 
 
 def _add_message(session_id: str, role: str, content: str):
-    history = _get_history(session_id)
-    history.append({"role": role, "content": content})
-    # 限制历史长度（保留 50 条，多余删除最早的）
-    if len(history) > _MAX_SESSION_HISTORY:
-        # 保留 system 消息 + 最近的
-        history[:] = history[-_MAX_SESSION_HISTORY:]
-
-
-def _trim_history(session_id: str, max_len: int = 50):
-    """清理会话历史到最大长度。"""
-    history = _get_history(session_id)
-    if len(history) > max_len:
-        history[:] = history[-max_len:]
+    if session_id not in _sessions:
+        _sessions[session_id] = {"history": [], "ip": ""}
+    _sessions[session_id]["history"].append({"role": role, "content": content})
+    if len(_sessions[session_id]["history"]) > _MAX_SESSION_HISTORY:
+        _sessions[session_id]["history"] = _sessions[session_id]["history"][-_MAX_SESSION_HISTORY:]
 
 
 # ============================================================
-# 支付检查 — 免费额度 + 402 保护
+# 支付检查
 # ============================================================
 
 def _get_client_ip(request: Request) -> str:
-    """提取真实客户端 IP（考虑 Nginx 反代）。"""
-    # Nginx 设置 X-Real-IP
-    x_real = request.headers.get("X-Real-IP", "")
-    if x_real:
-        return x_real.strip()
-    # 兜底: X-Forwarded-For 第一个
-    x_fwd = request.headers.get("X-Forwarded-For", "")
-    if x_fwd:
-        return x_fwd.split(",")[0].strip()
-    # 直连
-    return request.client.host if request.client else "unknown"
+    """提取真实客户端 IP。
+
+    仅当请求来自可信反代（TRUSTED_PROXY 白名单）时，才信任 X-Real-IP 头。
+    否则使用直连 IP。
+    """
+    trusted = set(TRUSTED_PROXY.split(",")) if TRUSTED_PROXY else set()
+    client_ip = request.client.host if request.client else "unknown"
+
+    # 只有来自可信代理的请求才读取 X-Real-IP
+    if client_ip in trusted:
+        x_real = request.headers.get("X-Real-IP", "")
+        if x_real:
+            return x_real.strip()
+    return client_ip
 
 
-def _require_payment(request: Request, session_id: str) -> Optional[HTTPException]:
+def _check_payment(request: Request, session_id: str) -> Optional[HTTPException]:
     """检查是否可以免费/已付费访问。
-
     返回 None 表示放行；返回 HTTPException(402) 表示需要付费。
-
-    免费额度: 每 IP 2 条
-    付费后: 该 IP 24 小时内无限使用
     """
     client_ip = _get_client_ip(request)
 
@@ -163,12 +191,12 @@ def _require_payment(request: Request, session_id: str) -> Optional[HTTPExceptio
 # FastAPI App
 # ============================================================
 
-app = FastAPI(title="高考志愿智能规划师", version="2.0.0")
+app = FastAPI(title="高考志愿智能规划师", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -176,6 +204,23 @@ app.add_middleware(
 _static_dir = os.path.join(_src_dir, "static")
 if os.path.isdir(_static_dir):
     app.mount("/static", StaticFiles(directory=_static_dir), name="static")
+
+
+# ============================================================
+# 请求日志中间件
+# ============================================================
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    duration = time.time() - start
+    logger.info(
+        "%s %s %d %.2fs",
+        request.method, request.url.path, response.status_code, duration
+    )
+    return response
+
 
 # ============================================================
 # Endpoints
@@ -192,27 +237,29 @@ async def index():
 
 @app.get("/health")
 async def health_check():
+    """健康检查 — 不调用真实 LLM，只检查基础组件状态。"""
+    checks = {
+        "fastapi": "ok",
+        "config": "error",
+        "assets": {"NotoSansSC-Regular.ttf": "missing"},
+    }
     try:
-        # 测试 LLM API 是否可达
         cfg = load_config()
-        result = chat_completion(
-            [{"role": "user", "content": "ping"}],
-            temperature=0,
-            max_tokens=10,
-        )
-        llm_ok = hasattr(result, "choices") and len(result.choices) > 0
-        return {
-            "status": "ok" if llm_ok else "degraded",
-            "checks": {
-                "fastapi": "ok",
-                "llm": "ok" if llm_ok else "error",
-                "assets": {"NotoSansSC-Regular.ttf": "ok" if os.path.exists(
-                    os.path.join(_project_root, "assets", "NotoSansSC-Regular.ttf")
-                ) else "missing"},
-            }
-        }
+        checks["config"] = "ok" if cfg else "error"
     except Exception as e:
-        return {"status": "degraded", "checks": {"fastapi": "ok", "llm": f"error: {str(e)[:100]}"}}
+        checks["config"] = f"error: {str(e)[:80]}"
+
+    font_path = os.path.join(_project_root, "assets", "NotoSansSC-Regular.ttf")
+    checks["assets"]["NotoSansSC-Regular.ttf"] = "ok" if os.path.exists(font_path) else "missing"
+
+    all_ok = all(
+        v == "ok" for v in checks.values()
+        if isinstance(v, str)
+    )
+    return {
+        "status": "ok" if all_ok else "degraded",
+        "checks": checks,
+    }
 
 
 @app.post("/chat")
@@ -223,20 +270,28 @@ async def chat(request: Request):
     except (ValidationError, json.JSONDecodeError) as e:
         raise HTTPException(status_code=422, detail=str(e)[:500])
 
+    client_ip = _get_client_ip(request)
+
+    # 速率限制
+    if not _check_rate_limit(client_ip, _RATE_CHAT_LIMIT):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+
+    # Session 隔离: 检查 session 是否属于此 IP
+    sess_ip = _get_session_ip(body.session_id)
+    if sess_ip and sess_ip != client_ip:
+        raise HTTPException(status_code=403, detail="会话不属于当前客户端")
+
     # 支付检查
-    payment_error = _require_payment(request, body.session_id)
+    payment_error = _check_payment(request, body.session_id)
     if payment_error:
         raise payment_error
 
     try:
         cfg = load_config()
-
-        # 构建消息列表
         history = _get_history(body.session_id)
         messages = list(history)
         messages.append({"role": "user", "content": body.message})
 
-        # 调 LLM（联网搜索默认开启）
         response = chat_completion(
             messages,
             system_prompt=cfg.get("sp", ""),
@@ -247,11 +302,9 @@ async def chat(request: Request):
 
         reply = response.choices[0].message.content or ""
 
-        # 保存历史
+        _sessions[body.session_id]["ip"] = client_ip
         _add_message(body.session_id, "user", body.message)
         _add_message(body.session_id, "assistant", reply)
-
-        _trim_history(body.session_id)
 
         return {"status": "success", "session_id": body.session_id, "message": reply}
 
@@ -264,27 +317,33 @@ async def chat(request: Request):
 
 @app.post("/stream")
 async def stream(request: Request):
-    """流式对话 (SSE) — 直接用 DeepSeek 流式 API。"""
+    """流式对话 (SSE)。"""
     try:
         raw = await request.json()
         body = ChatRequest(**raw)
     except (ValidationError, json.JSONDecodeError) as e:
         raise HTTPException(status_code=422, detail=str(e)[:500])
 
-    # 支付检查
-    payment_error = _require_payment(request, body.session_id)
+    client_ip = _get_client_ip(request)
+
+    if not _check_rate_limit(client_ip, _RATE_STREAM_LIMIT):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+
+    sess_ip = _get_session_ip(body.session_id)
+    if sess_ip and sess_ip != client_ip:
+        raise HTTPException(status_code=403, detail="会话不属于当前客户端")
+
+    payment_error = _check_payment(request, body.session_id)
     if payment_error:
         raise payment_error
 
     async def event_stream():
         try:
             cfg = load_config()
-
             history = _get_history(body.session_id)
             messages = list(history)
             messages.append({"role": "user", "content": body.message})
 
-            # 流式调用（联网搜索默认开启）
             response = chat_completion(
                 messages,
                 system_prompt=cfg.get("sp", ""),
@@ -294,6 +353,7 @@ async def stream(request: Request):
             )
 
             full_reply = ""
+            last_heartbeat = time.time()
             for chunk in response:
                 if chunk.choices and len(chunk.choices) > 0:
                     delta = chunk.choices[0].delta
@@ -301,14 +361,16 @@ async def stream(request: Request):
                         content = delta.content
                         full_reply += content
                         yield f"data: {json.dumps({'type': 'ai', 'content': content, 'session_id': body.session_id}, ensure_ascii=False)}\n\n"
-                # 每 5s 发一次心跳
-                yield ": heartbeat\n\n"
+                # 每 5 秒发一次心跳（不是每个 chunk）
+                now = time.time()
+                if now - last_heartbeat >= 5:
+                    yield ": heartbeat\n\n"
+                    last_heartbeat = now
 
-            # 保存历史
+            _sessions[body.session_id]["ip"] = client_ip
             _add_message(body.session_id, "user", body.message)
             if full_reply:
                 _add_message(body.session_id, "assistant", full_reply)
-            _trim_history(body.session_id)
 
             yield "data: [DONE]\n\n"
 
@@ -327,6 +389,29 @@ async def stream(request: Request):
     )
 
 
+@app.get("/download/{report_id}")
+async def download_report(report_id: str):
+    """下载生成的报告文件。"""
+    # 安全检查：防止路径遍历
+    if ".." in report_id or "/" in report_id or "\\" in report_id:
+        raise HTTPException(status_code=400, detail="非法 report_id")
+
+    filepath = _get_report_filepath(report_id)
+    if not filepath or not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="报告不存在或已过期")
+
+    ext = os.path.splitext(filepath)[1].lower()
+    media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document" if ext == ".docx" else "application/pdf"
+    filename = f"Gaokao_Report{ext}"
+
+    return FileResponse(
+        filepath,
+        media_type=media_type,
+        filename=filename,
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
 @app.get("/config")
 async def get_config():
     cfg = load_config()
@@ -337,7 +422,7 @@ async def get_config():
         "tools": cfg.get("tools"),
         "payment": {
             "enabled": True,
-            "free_messages": 3,
+            "free_messages": get_free_quota("_template"),
             "paid_duration_hours": 24,
             "pricing": {
                 "chat": {"goods_name": "高考志愿深度分析-单次对话", "amount": "3.00"},
@@ -349,7 +434,6 @@ async def get_config():
 
 @app.get("/payment/status")
 async def payment_status(request: Request, session_id: str):
-    """查询付费状态和剩余免费额度。"""
     client_ip = _get_client_ip(request)
     paid = has_paid(client_ip)
     expiry = get_paid_expiry(client_ip)
@@ -365,12 +449,11 @@ async def payment_status(request: Request, session_id: str):
 
 @app.get("/buy/report")
 async def buy_report(session_id: str):
-    """购买志愿评估报告 — 返回 402 Payment-Needed。"""
     try:
         cfg = load_config()
         pricing = cfg.get("pricing", {}).get("report", {})
         goods_name = pricing.get("goods_name", "高考志愿综合评估报告")
-        amount = pricing.get("amount", "0.99")
+        amount = pricing.get("amount", "9.90")
     except Exception:
         goods_name = "高考志愿综合评估报告"
         amount = "9.90"
@@ -388,7 +471,12 @@ async def buy_report(session_id: str):
 
 
 @app.post("/admin/reload-config")
-async def admin_reload_config():
+async def admin_reload_config(request: Request):
+    """热重载配置 — 需要 ADMIN_TOKEN。"""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not token or token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized: 需要有效的 ADMIN_TOKEN")
+
     try:
         new_cfg = reload_config()
         reload_merchant_config()
@@ -405,5 +493,5 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    logger.info(f"启动 HTTP 服务（联网搜索已开启），端口: {args.port}")
+    logger.info(f"启动 HTTP 服务 v2.1（联网搜索已开启），端口: {args.port}")
     uvicorn.run("main:app", host="0.0.0.0", port=args.port, reload=False)

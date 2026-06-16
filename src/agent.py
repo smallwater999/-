@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import logging
+import threading
 from typing import List, Dict, Any, Optional
 
 _src_dir = os.path.dirname(os.path.abspath(__file__))
@@ -22,24 +23,27 @@ if _src_dir not in sys.path:
 logger = logging.getLogger(__name__)
 
 _config_cache = None
+_config_lock = threading.Lock()
 
 
 def load_config() -> dict:
     global _config_cache
-    if _config_cache is not None:
+    with _config_lock:
+        if _config_cache is not None:
+            return _config_cache
+        config_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "config", "agent_llm_config.json"
+        )
+        with open(config_path, "r", encoding="utf-8") as f:
+            _config_cache = json.load(f)
         return _config_cache
-    config_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "config", "agent_llm_config.json"
-    )
-    with open(config_path, "r", encoding="utf-8") as f:
-        _config_cache = json.load(f)
-    return _config_cache
 
 
 def reload_config():
     global _config_cache
-    _config_cache = None
+    with _config_lock:
+        _config_cache = None
     return load_config()
 
 
@@ -48,22 +52,24 @@ def reload_config():
 # ============================================================
 
 _client = None
+_client_lock = threading.Lock()
 
 
 def get_client():
     """获取 LLM 客户端实例（带联网搜索）。"""
     global _client
-    if _client is None:
-        from openai import OpenAI
-        cfg = load_config()
-        api_key = os.getenv("LLM_API_KEY", "")
-        base_url = os.getenv("LLM_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
-        model = os.getenv("LLM_MODEL", cfg["config"].get("model", "deepseek-v4-flash-260425"))
-        _client = {
-            "client": OpenAI(api_key=api_key, base_url=base_url),
-            "model": model,
-        }
-    return _client
+    with _client_lock:
+        if _client is None:
+            from openai import OpenAI
+            cfg = load_config()
+            api_key = os.getenv("LLM_API_KEY", "")
+            base_url = os.getenv("LLM_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
+            model = os.getenv("LLM_MODEL", cfg["config"].get("model", "deepseek-v4-flash-260425"))
+            _client = {
+                "client": OpenAI(api_key=api_key, base_url=base_url),
+                "model": model,
+            }
+        return _client
 
 
 def chat_completion(
@@ -78,18 +84,19 @@ def chat_completion(
 
     Args:
         messages: 对话消息列表 [{"role": "user", "content": "..."}, ...]
-        system_prompt: 可选的 system prompt（会插入到 messages 最前面）
+        system_prompt: 可选的 system prompt
         temperature: 温度参数
         max_tokens: 最大输出 token
         stream: 是否流式输出
 
     Returns:
-        stream=False: 返回完整响应字符串
+        stream=False: 返回完整响应对象
         stream=True: 返回迭代器
     """
     client_info = get_client()
     client = client_info["client"]
     model = client_info["model"]
+    cfg = load_config()
 
     full_messages = []
     if system_prompt:
@@ -102,6 +109,7 @@ def chat_completion(
         "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": stream,
+        "timeout": float(cfg.get("config", {}).get("timeout", 300)),
         "extra_body": {
             "search": True,
             "thinking": {"type": "disabled"},

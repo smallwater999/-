@@ -15,10 +15,14 @@ import os
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 logger = logging.getLogger(__name__)
 
 _MERCHANT_CONFIG: Optional[dict] = None
+_QUOTA_LOCK = __import__('threading').Lock()
 _IP_QUOTA: Dict[str, int] = {}  # {client_ip: remaining_free_msgs}
 _PAID_IPS: Dict[str, str] = {}  # {client_ip: paid_until_iso8601}
 
@@ -59,10 +63,6 @@ def reload_merchant_config():
 
 def _rsa2_sign(params: dict, private_key_pem: str) -> str:
     """对参数字典做 RSA2-SHA256 签名，返回 Base64 字符串。"""
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import padding
-    from cryptography.hazmat.primitives.serialization import load_pem_private_key
-
     # 按 key 字母序排序，过滤空值，拼接 k=v&k=v
     keys = sorted(params.keys())
     sign_str = "&".join(
@@ -148,21 +148,36 @@ PAID_DURATION_HOURS = 24  # 付费后有效时长
 
 def get_free_quota(ip: str) -> int:
     """返回该 IP 剩余免费消息数。"""
-    return _IP_QUOTA.get(ip, FREE_QUOTA_PER_IP)
+    with _QUOTA_LOCK:
+        return _IP_QUOTA.get(ip, FREE_QUOTA_PER_IP)
 
 
 def use_free_quota(ip: str) -> bool:
     """消耗一次免费额度，返回是否消耗成功。"""
-    remaining = _IP_QUOTA.get(ip, FREE_QUOTA_PER_IP)
-    if remaining > 0:
-        _IP_QUOTA[ip] = remaining - 1
-        return True
-    return False
+    with _QUOTA_LOCK:
+        remaining = _IP_QUOTA.get(ip, FREE_QUOTA_PER_IP)
+        if remaining > 0:
+            _IP_QUOTA[ip] = remaining - 1
+            return True
+        return False
+
+
+def _cleanup_expired_payments():
+    """清理过期的付费记录，防止内存泄漏。"""
+    with _QUOTA_LOCK:
+        now = datetime.now(timezone.utc)
+        expired = [ip for ip, until in _PAID_IPS.items()
+                   if datetime.fromisoformat(until) < now]
+        for ip in expired:
+            del _PAID_IPS[ip]
+        if expired:
+            logger.info(f"清理了 {len(expired)} 条过期付费记录")
 
 
 def has_paid(ip: str) -> bool:
     """检查该 IP 是否在付费有效期内。"""
-    paid_until = _PAID_IPS.get(ip)
+    with _QUOTA_LOCK:
+        paid_until = _PAID_IPS.get(ip)
     if not paid_until:
         return False
     try:
@@ -175,13 +190,16 @@ def has_paid(ip: str) -> bool:
 def mark_as_paid(ip: str, payment_proof: str):
     """标记 IP 为已付费，有效期 24 小时。"""
     expiry = datetime.now(timezone.utc) + timedelta(hours=PAID_DURATION_HOURS)
-    _PAID_IPS[ip] = expiry.isoformat()
+    with _QUOTA_LOCK:
+        _PAID_IPS[ip] = expiry.isoformat()
+    _cleanup_expired_payments()
     logger.info("IP %s 已付费，有效期至 %s, proof=%s...", ip, expiry.isoformat(), payment_proof[:20])
 
 
 def get_paid_expiry(ip: str) -> Optional[str]:
     """返回该 IP 的付费到期时间（ISO格式），未付费返回 None。"""
-    return _PAID_IPS.get(ip)
+    with _QUOTA_LOCK:
+        return _PAID_IPS.get(ip)
 
 
 # --- 支付凭证校验 ---
@@ -189,18 +207,26 @@ def get_paid_expiry(ip: str) -> Optional[str]:
 def validate_payment_proof(payment_proof: str) -> bool:
     """校验支付凭证是否有效。
 
-    简单策略: 只要凭证非空且格式合理就放行。
-    真实的支付宝验证由 alipay-bot 在支付流程中完成。
+    验证策略:
+    - 最小长度 64 字符（支付宝 payment-proof 至少 64 hex 字符）
+    - 必须是有效的 hex 字符串
+    - 生产环境需接入支付宝回调验证
     """
-    if not payment_proof or len(payment_proof) < 32:
+    if not payment_proof:
         return False
-    # 检查是否为有效的 hex 字符串 (支付宝 payment-proof 格式)
+    # 防止 CPU 耗尽: 限制输入长度
+    if len(payment_proof) > 4096:
+        return False
+    # 至少 64 个 hex 字符 (32 bytes = 64 hex chars)
+    if len(payment_proof.strip()) < 64:
+        return False
+    # 检查是否为有效的 hex 字符串
     try:
-        int(payment_proof, 16)
+        int(payment_proof.strip()[:512], 16)
         return True
     except ValueError:
-        # 也可能是 base64
-        return len(payment_proof) >= 32
+        logger.warning("支付凭证格式无效 (非 hex)")
+        return False
 
 
 def check_payment_header(request_headers: dict) -> Optional[str]:
