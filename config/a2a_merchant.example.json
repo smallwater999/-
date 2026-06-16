@@ -1,0 +1,21 @@
+{
+    "_说明": "复制此文件为 a2a_merchant.json 并填入你在支付宝开放平台注册的真实信息",
+    "app_id": "你的支付宝AppId",
+    "seller_id": "你的SellerId",
+    "seller_name": "你的商户名称",
+    "service_id": "你的ServiceId",
+    "private_key_path": "config/a2a_private_key.pem",
+    "pricing": {
+        "chat_per_session": {
+            "goods_name": "高考志愿深度分析-单次对话",
+            "amount": "3.00"
+        },
+        "report": {
+            "goods_name": "高考志愿综合评估报告",
+            "amount": "9.90"
+        }
+    },
+    "free_quota": {
+        "messages_per_session": 2
+    }
+}
