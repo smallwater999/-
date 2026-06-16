@@ -27,10 +27,10 @@ def generate_report_impl(content: str, title: str, format: str = "pdf") -> str:
         os.makedirs(REPORTS_DIR, exist_ok=True)
         content = _clean_markdown(content)
 
-        # 修复日期
+        # 修复日期 — 只替换"报告生成时间"标注行，不修改正文历史数据
         current_date = datetime.now().strftime("%Y年%m月%d日")
-        content = re.sub(r'\d{4}年\d{1,2}月\d{1,2}日', current_date, content)
-        content = re.sub(r'报告生成时间[:：]?\s*\d{4}年', f'报告生成时间：{datetime.now().year}年', content)
+        content = re.sub(r'报告生成时间[:：]\s*\d{4}年\d{1,2}月\d{1,2}日', f'报告生成时间：{current_date}', content)
+        content = re.sub(r'报告生成时间[:：]\s*\d{4}年', f'报告生成时间：{datetime.now().year}年', content)
 
         safe_title = re.sub(r'[^\w\-]', '_', title)
         report_id = f"{safe_title}_{uuid.uuid4().hex[:8]}"
